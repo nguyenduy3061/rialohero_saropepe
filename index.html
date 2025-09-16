@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>RIALO Runner</title>
+  <style>
+    :root{--bg:#f2ebdb;--ink:#111;--accent:#06f;--neon:#7ef9ff;--danger:#ff3b3b;--good:#00d084}
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial}
+    body{display:flex;align-items:center;justify-content:center;background:var(--bg);color:#111}
+    .wrap{width:100%;max-width:940px;padding:12px}
+    canvas{width:100%;height:auto;border-radius:18px;box-shadow:0 10px 28px rgba(0,0,0,.10)}
+    .hud{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-top:10px}
+    .btn{appearance:none;border:0;background:#111;color:#fff;padding:10px 14px;border-radius:12px;font-weight:600;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .pill{padding:6px 10px;border-radius:999px;background:#000;color:#fff;font-weight:600}
+    .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#111;color:#fff;border-radius:8px;padding:2px 6px}
+    .bar{height:12px;background:#e8e2cf;border-radius:999px;overflow:hidden}
+    .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--neon),#66ff99);box-shadow:0 0 16px var(--neon)}
+    footer{margin-top:8px;font-size:12px;opacity:.7}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="960" height="480" aria-label="RIALO Runner game"></canvas>
+
+    <div class="hud">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span class="pill">Score: <b id="score">0</b></span>
+        <span class="pill">Best: <b id="best">0</b></span>
+        <span class="pill">Speed: <b id="speed">1.0x</b></span>
+        <span class="pill" id="logoStatus">Logo: <b>loading…</b></span>
+      </div>
+      <div style="flex:1"></div>
+      <button class="btn" id="restart">Restart <span class="kbd">R</span></button>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+      <div style="min-width:90px;font-weight:700">ENERGY</div>
+      <div class="bar" style="flex:1"><i id="energyFill" style="width:0%"></i></div>
+      <div id="mode" class="pill" style="background:#111">NORMAL</div>
+    </div>
+
+    <footer>
+      Controls: <span class="kbd">Space</span>/<span class="kbd">↑</span>/<span class="kbd">Tap</span> to jump. <span class="kbd">R</span> to restart. Collect energy sparks, avoid bugs/viruses. Fill the bar to enter <b>HERO MODE</b> and burst through obstacles.
+    </footer>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+  const speedEl = document.getElementById('speed');
+  const energyFill = document.getElementById('energyFill');
+  const modeEl = document.getElementById('mode');
+  const restartBtn = document.getElementById('restart');
+  const logoStatus = document.getElementById('logoStatus');
+
+  // ---------- Canvas scaling (HDPI) ----------
+  function fit(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = Math.min(960, document.querySelector('.wrap').clientWidth);
+    const cssH = 0.5 * cssW;
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  fit();
+  addEventListener('resize', fit);
+
+  // ---------- Game constants ----------
+  const GROUND_Y = 360; // baseline
+  const GRAVITY = 0.8;
+  const JUMP_V = -13.2;
+
+  // ---------- State ----------
+  let running = true;
+  let score = 0;
+  let best = Number(localStorage.getItem('rialo_best')||0);
+  bestEl.textContent = best;
+  let speed = 6; // pixels per frame base
+  let spawnTimer = 0;
+  let spawnEvery = 90; // frames
+  let things = []; // obstacles & sparks
+  let t = 0;
+  let energy = 0; // 0..100
+  let hero = false;
+  let heroLeft = 0; // frames remaining
+
+  // Player (logo)
+  const player = {x: 140, y: GROUND_Y-64, w: 64, h: 64, vy: 0, onGround: true};
+
+  // ---------- Logo loading (robust) ----------
+  // Replace this URL with your PNG logo URL
+  const LOGO_URL = "https://i.ibb.co/Rp4cXRjf/logo.png"; // 👈 change here
+  const logoImg = new Image();
+  logoImg.crossOrigin = 'anonymous'; // avoid CORS-tainted canvas if image allows it
+  let logoReady = false;
+  let logoError = false;
+  logoImg.onload = () => {
+    logoReady = true;
+    logoStatus.innerHTML = 'Logo: <b>OK</b>';
+  };
+  logoImg.onerror = (e) => {
+    logoError = true;
+    logoStatus.innerHTML = 'Logo: <b style="color:#ff3b3b">failed</b>';
+    console.warn('[RIALO Runner] Logo failed to load:', LOGO_URL, e);
+  };
+  logoImg.src = LOGO_URL;
+
+  // Safe wrapper so drawImage never throws with broken images
+  function safeDrawImage(img, dx, dy, dw, dh){
+    try{
+      if(!img || !img.complete || !img.naturalWidth || !img.naturalHeight) return false;
+      ctx.drawImage(img, dx, dy, dw, dh);
+      return true;
+    }catch(err){
+      console.warn('[RIALO Runner] drawImage prevented:', err);
+      return false;
+    }
+  }
+
+  function reset(){
+    running = true;
+    score = 0; speed = 6; spawnEvery = 90; things = []; t = 0; energy = 0; hero=false; heroLeft=0;
+    player.x = 140; player.y = GROUND_Y-64; player.vy = 0; player.onGround=true;
+    energyFill.style.width = '0%';
+    modeEl.textContent = 'NORMAL'; modeEl.style.background = '#111';
+  }
+
+  restartBtn.addEventListener('click', reset);
+
+  addEventListener('keydown', e=>{
+    if(e.code==='Space' || e.code==='ArrowUp'){ e.preventDefault(); jump(); }
+    if(e.code==='KeyR'){ reset(); }
+  });
+  canvas.addEventListener('pointerdown', jump);
+
+  function jump(){
+    if(!running) return;
+    if(player.onGround){ player.vy = JUMP_V; player.onGround = false; }
+  }
+
+  function rand(a,b){ return Math.random()*(b-a)+a; }
+
+  function makeObstacle(){
+    const typePick = Math.random();
+    if(typePick < 0.65){ // bug
+      things.push({kind:'bug', x: canvas.width/ (window.devicePixelRatio||1) + 40, y:GROUND_Y-30, w:30, h:30, vx: speed});
+    } else if (typePick < 0.9){ // virus
+      things.push({kind:'virus', x: canvas.width/ (window.devicePixelRatio||1) + 40, y:GROUND_Y-50, w:28, h:50, vx: speed});
+    } else { // boss
+      things.push({kind:'boss', x: canvas.width/ (window.devicePixelRatio||1) + 40, y:GROUND_Y-70, w:60, h:60, vx: speed*0.9});
+    }
+
+    if(Math.random()<0.8){
+      const sx = canvas.width/ (window.devicePixelRatio||1) + rand(120, 240);
+      const sy = GROUND_Y - rand(80, 160);
+      things.push({kind:'spark', x:sx, y:sy, w:18, h:18, vx: speed*0.95, t:0});
+    }
+  }
+
+  function drawBackground(){
+    const w = canvas.width/(window.devicePixelRatio||1), h = canvas.height/(window.devicePixelRatio||1);
+    const grd = ctx.createLinearGradient(0,0,0,h);
+    grd.addColorStop(0,'#0c0f14');
+    grd.addColorStop(1,'#1a1f2b');
+    ctx.fillStyle = grd; ctx.fillRect(0,0,w,h);
+
+    ctx.strokeStyle = hero ? '#7ef9ff' : '#66d1ff';
+    ctx.lineWidth = 3;
+    ctx.shadowColor = hero? '#7ef9ff' : '#0bf';
+    ctx.shadowBlur = hero ? 16 : 6;
+    ctx.beginPath();
+    ctx.moveTo(0,GROUND_Y); ctx.lineTo(w,GROUND_Y); ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawRialo(x,y,w,h){
+    ctx.save();
+    ctx.shadowColor = hero ? '#7ef9ff' : 'rgba(0,0,0,0.3)';
+    ctx.shadowBlur = hero ? 20 : 6;
+    // Try to draw the loaded logo; fall back to a neon blob if not ready or failed
+    const drawn = (!logoError && logoReady) && safeDrawImage(logoImg, x - w/2, y - h/2, w, h);
+    if(!drawn){
+      // Fallback placeholder (neon blob)
+      ctx.fillStyle = hero ? '#bffcff' : '#111';
+      const r = Math.min(w,h)/6;
+      roundRect(x - w/2, y - h/2, w, h, r);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function roundRect(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  function drawThing(o){
+    ctx.save();
+    if(o.kind==='spark'){
+      ctx.shadowColor = '#7ef9ff';
+      ctx.shadowBlur = 14 + 6*Math.sin(o.t*0.4);
+      ctx.fillStyle = '#bffcff';
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.w/2, 0, Math.PI*2); ctx.fill();
+    } else {
+      ctx.fillStyle = '#e63946';
+      ctx.fillRect(o.x,o.y,o.w,o.h);
+    }
+    ctx.restore();
+  }
+
+  function rectsOverlap(a,b){
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function update(){
+    if(!running){ draw(); requestAnimationFrame(update); return; }
+
+    t++;
+    score += 0.1 + speed*0.01;
+    speed += 0.0009;
+    speedEl.textContent = (speed/6).toFixed(2) + 'x';
+
+    spawnTimer++;
+    if(spawnTimer > spawnEvery){
+      spawnTimer = 0; makeObstacle();
+      if(spawnEvery>55) spawnEvery -= 1;
+    }
+
+    player.vy += GRAVITY;
+    player.y += player.vy;
+    if(player.y + player.h > GROUND_Y){
+      player.y = GROUND_Y - player.h;
+      player.vy = 0; player.onGround = true;
+    } else {
+      player.onGround = false;
+    }
+
+    for(const o of things){
+      o.x -= (o.vx || speed);
+      if(o.kind==='spark'){ o.t = (o.t||0)+1; }
+    }
+    things = things.filter(o => o.x + o.w > -40);
+
+    if(hero){ heroLeft--; if(heroLeft<=0){ hero=false; modeEl.textContent='NORMAL'; modeEl.style.background='#111'; } }
+
+    const pBox = {x: player.x-24, y: player.y-24, w: player.w-16, h: player.h-16};
+    for(const o of things){
+      if(o.kind==='spark' && rectsOverlap(pBox, o)){
+        o.x = -9999;
+        energy = Math.min(100, energy + 25);
+        energyFill.style.width = energy + '%';
+        score += 5;
+        if(energy>=100){ hero = true; heroLeft = 60*6; energy=0; energyFill.style.width='0%'; modeEl.textContent='HERO MODE'; modeEl.style.background='#0a84ff'; speed+=1.8; }
+      }
+      if((o.kind!=='spark') && rectsOverlap(pBox, o)){
+        if(hero){ o.x = -9999; score += 3; }
+        else { gameOver(); break; }
+      }
+    }
+
+    draw();
+    requestAnimationFrame(update);
+  }
+
+  function gameOver(){
+    running = false;
+    best = Math.max(best, Math.floor(score));
+    localStorage.setItem('rialo_best', best);
+    bestEl.textContent = best;
+  }
+
+  function draw(){
+    const w = canvas.width/(window.devicePixelRatio||1), h = canvas.height/(window.devicePixelRatio||1);
+    drawBackground();
+    drawRialo(player.x, player.y+player.h/2, player.w, player.h);
+    for(const o of things){ drawThing(o); }
+    if(!running){ ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,w,h); ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='700 36px Inter'; ctx.fillText('GAME OVER', w/2,h/2); }
+    scoreEl.textContent = Math.floor(score);
+  }
+
+  // ---------- Minimal self-tests (run automatically) ----------
+  // They log to the console; open DevTools to see results.
+  (function runSelfTests(){
+    // Test 1: safeDrawImage returns false for not-yet-loaded image and does not throw
+    const tmp = new Image();
+    let ok1 = false; try { ok1 = (safeDrawImage(tmp, 0,0,10,10) === false); } catch(e){ ok1 = false; }
+    console.assert(ok1, 'Test1 failed: safeDrawImage should return false for incomplete image');
+
+    // Test 2: broken image triggers error and still does not crash draw
+    const broken = new Image();
+    broken.onerror = () => {
+      const ok2 = (safeDrawImage(broken, 0,0,10,10) === false);
+      console.assert(ok2, 'Test2 failed: safeDrawImage should return false for broken image');
+    };
+    broken.src = 'data:image/png;base64,broken'; // invalid base64 -> will error
+  })();
+
+  // Kick off
+  reset();
+  update();
+})();
+</script>
+</body>
+</html>
